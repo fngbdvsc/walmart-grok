@@ -73,9 +73,9 @@ MAX_VERIFY_PER_ROUND = 4       # product-page checks triggered by search results
 MAX_VERIFY_TRIES = 3
 RECHECK_SECONDS = 120
 # If Walmart shows its bot-check page, pause this many seconds, doubling each time up to BLOCK_RETRY_MAX.
-# Both can be set in Railway Variables (e.g. BLOCK_RETRY_SECONDS=300, BLOCK_RETRY_MAX=1800 for the old pacing).
-BACKOFF_START = int(os.environ.get("BLOCK_RETRY_SECONDS", "10"))
-BACKOFF_MAX = int(os.environ.get("BLOCK_RETRY_MAX", str(BACKOFF_START)))
+# A homepage that still loads is not a recovery. Only a real product page clears the block.
+BACKOFF_START = int(os.environ.get("BLOCK_RETRY_SECONDS", "60"))
+BACKOFF_MAX = int(os.environ.get("BLOCK_RETRY_MAX", "600"))
 BLOCK_UPDATE_SECONDS = 600     # while a block lasts, post a "still blocked" update this often
 
 # Search scan only considers items whose name contains one of these (accents ignored, so "Pokémon" matches).
@@ -466,7 +466,7 @@ class Monitor:
     # ---- small helpers
     def dash_log(self, kind, content, sku=None):
         if self.shipper:
-            self.shipper.push(kind, re.sub(r"[`*]", "", content), sku)
+            self.shipper.push(kind, re.sub(r"[*`]", "", content), sku)
 
     def dash_error(self, key, content, sku=None):
         """Every error goes to the Discord error channel; the dashboard gets the same one at most every ERROR_REPEAT_SECONDS."""
@@ -596,16 +596,17 @@ class Monitor:
                     continue
                 await self.run_job(job)
                 self.good_pages += 1
-                if self.was_blocked:
+                # Homepage and search often still load while product pages are challenged.
+                # Don't call that a recovery or the pause resets and the same page is hit again.
+                if self.was_blocked and job[0] in ("sku", "verify"):
                     self.was_blocked = False
                     self.backoff = BACKOFF_START
+                    self.blocks_in_row = 0
                     mins = (self.clock() - self.block_started) / 60
-                    tries = (f" after {self.blocks_in_row} blocked tries over {mins:.0f} min"
-                             if self.blocks_in_row > 1 else "")
-                    places = ", ".join(f"{p} x{n}" if n > 1 else p
-                                       for p, n in self.block_places.items())
-                    await self._say(f"Back to normal{tries}: Walmart is returning real data again, resuming checks. "
-                                    f"Blocked on: {places}. Got through on: {page_name(job)}.")
+                    tries = (f" after several blocked tries over {mins:.0f} min"
+                             if mins >= 1 else "")
+                    await self._say(f"Back to normal{tries}: product pages are loading again "
+                                    f"({page_name(job)}).")
             except Blocked as b:
                 first_block = not self.was_blocked
                 self.was_blocked = True
