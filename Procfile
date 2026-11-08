@@ -1,1 +1,1 @@
-worker: python walmart_monitor.py
+worker: xvfb-run -a --server-args=-screen 0 1366x768x24 python walmart_monitor.py

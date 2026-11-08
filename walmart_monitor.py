@@ -93,9 +93,12 @@ BASE = "https://www.walmart.ca"
 # browser, so Chrome is the default. Set FETCHER=curl only to compare.
 IMPERSONATE = os.environ.get("IMPERSONATE", "chrome").strip() or "chrome"
 FETCHER = os.environ.get("FETCHER", "browser").strip().lower()
-# A normal window completes Walmart's page check. HEADLESS=1 hides it, which is faster to paint but
-# more likely to sit on "Verify Your Identity".
-HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+# A normal window completes Walmart's page check. HEADLESS=1 hides it.
+# With no setting: a window when a display exists (your Mac, or xvfb), hidden when it doesn't.
+if os.environ.get("HEADLESS"):
+    HEADLESS = os.environ.get("HEADLESS") == "1"
+else:
+    HEADLESS = not os.environ.get("DISPLAY")
 # How long to keep looking for the product data after the page starts loading. Returns sooner if it's there.
 PAGE_WAIT_SECONDS = float(os.environ.get("PAGE_WAIT_SECONDS", "8"))
 # With the dashboard connected, status messages ("Now watching", blocks, Online) go only to the dashboard and
@@ -387,11 +390,15 @@ class BrowserSession:
         from playwright.async_api import async_playwright
         self._pw = await async_playwright().start()
         args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage",
-                "--disable-extensions", "--blink-settings=imagesEnabled=false", "--no-first-run"]
+                "--disable-extensions", "--blink-settings=imagesEnabled=false", "--no-first-run",
+                "--renderer-process-limit=1", "--disable-background-networking",
+                "--disable-component-update"]
         if self.proxy:
             args += ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                      "--webrtc-ip-handling-policy=disable_non_proxied_udp"]
-        prefer = os.environ.get("CHROME_CHANNEL", "chrome").strip() or "chrome"
+        # On a server there is no Google Chrome, only Playwright's Chromium. On a Mac, use Chrome.
+        default_channel = "chromium" if sys.platform.startswith("linux") else "chrome"
+        prefer = os.environ.get("CHROME_CHANNEL", default_channel).strip() or default_channel
         channels = []
         for name in (prefer, "chrome", "msedge", "chromium"):
             if name not in channels:
@@ -408,6 +415,9 @@ class BrowserSession:
                 last = e
                 print(f"[browser] couldn't start {channel}: {type(e).__name__}: {str(e).splitlines()[0][:160]}")
         if last is not None or self._browser is None:
+            detail = str(last or "couldn't start Chrome")
+            if "Executable doesn't exist" in detail or "BrowserType.launch" in detail:
+                raise Blocked("Chrome is not installed in this container, so no product page can be opened.")
             raise last or RuntimeError("couldn't start Chrome")
         self._closing = False
         self._browser.on("disconnected", lambda _b: None if self._closing else

@@ -1,6 +1,14 @@
 {
   "$schema": "https://schema.railpack.com",
+  "buildAptPackages": ["xvfb"],
+  "steps": {
+    "install": {
+      "commands": [
+        "python -m playwright install --with-deps chromium"
+      ]
+    }
+  },
   "deploy": {
-    "startCommand": "python walmart_monitor.py"
+    "startCommand": "xvfb-run -a --server-args=-screen 0 1366x768x24 python walmart_monitor.py"
   }
 }
