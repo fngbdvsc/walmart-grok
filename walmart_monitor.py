@@ -95,9 +95,11 @@ BASE = "https://www.walmart.ca"
 IMPERSONATE = os.environ.get("IMPERSONATE", "chrome").strip() or "chrome"
 FETCHER = os.environ.get("FETCHER", "browser").strip().lower()
 # A normal window completes Walmart's page check. HEADLESS=1 hides it.
-# With no setting: a window when a display exists (your Mac, or xvfb), hidden when it doesn't.
+# Mac terminals do not set DISPLAY, so a Mac defaults to a visible window.
 if os.environ.get("HEADLESS"):
     HEADLESS = os.environ.get("HEADLESS") == "1"
+elif sys.platform == "darwin":
+    HEADLESS = False
 else:
     HEADLESS = not os.environ.get("DISPLAY")
 # How long to keep looking for the product data after the page starts loading. Returns sooner if it's there.
