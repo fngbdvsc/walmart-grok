@@ -24,6 +24,7 @@ import json
 import time
 import random
 import asyncio
+import threading
 import unicodedata
 from collections import deque
 from datetime import datetime
@@ -392,7 +393,10 @@ class BrowserSession:
         args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage",
                 "--disable-extensions", "--blink-settings=imagesEnabled=false", "--no-first-run",
                 "--renderer-process-limit=1", "--disable-background-networking",
-                "--disable-component-update"]
+                "--disable-component-update", "--disable-gpu"]
+        if sys.platform.startswith("linux"):
+            # Chrome refuses to start as root inside Docker without these.
+            args += ["--no-sandbox", "--disable-setuid-sandbox"]
         if self.proxy:
             args += ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                      "--webrtc-ip-handling-policy=disable_non_proxied_udp"]
@@ -1137,7 +1141,31 @@ async def debug_sku(sku):
 
 
 # ------------------------------------------------------------ discord bot
+def listen_for_railway(port):
+    """Railway restarts a container that never opens a port. This only answers 'ok'."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    except Exception as e:
+        print(f"[health] could not listen on {port}: {e}", flush=True)
+
+
 def run_bot():
+    print("walmart monitor process started", flush=True)
+    port = int(os.environ.get("PORT", "0") or "0")
+    if port:
+        threading.Thread(target=listen_for_railway, args=(port,), daemon=True).start()
+        print(f"health check listening on {port}", flush=True)
     import discord
 
     token = os.environ.get("DISCORD_TOKEN") or DISCORD_TOKEN
