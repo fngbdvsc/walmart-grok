@@ -1,0 +1,4 @@
+discord.py>=2.3
+curl_cffi>=0.7
+playwright==1.63.0
+tzdata
