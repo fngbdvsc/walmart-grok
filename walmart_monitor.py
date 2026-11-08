@@ -104,6 +104,8 @@ else:
     HEADLESS = not os.environ.get("DISPLAY")
 # How long to keep looking for the product data after the page starts loading. Returns sooner if it's there.
 PAGE_WAIT_SECONDS = float(os.environ.get("PAGE_WAIT_SECONDS", "8"))
+# A visible window may be showing a check for you to finish. The script does not complete it.
+CHALLENGE_WAIT_SECONDS = float(os.environ.get("CHALLENGE_WAIT_SECONDS", "180"))
 # With the dashboard connected, status messages ("Now watching", blocks, Online) go only to the dashboard and
 # Discord gets only Restock / New Item alerts. Set STATUS_IN_DISCORD=1 to also post them in Discord.
 STATUS_IN_DISCORD = os.environ.get("STATUS_IN_DISCORD", "0") == "1"
@@ -380,6 +382,7 @@ class BrowserSession:
         self._crashed = False
         self._closing = False
         self._lock = asyncio.Lock()
+        self.on_challenge = None
 
     def _alive(self):
         return (self._page is not None and not self._crashed and not self._page.is_closed()
@@ -393,9 +396,11 @@ class BrowserSession:
         from playwright.async_api import async_playwright
         self._pw = await async_playwright().start()
         args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage",
-                "--disable-extensions", "--blink-settings=imagesEnabled=false", "--no-first-run",
+                "--disable-extensions", "--no-first-run",
                 "--renderer-process-limit=1", "--disable-background-networking",
                 "--disable-component-update", "--disable-gpu"]
+        if HEADLESS:
+            args.append("--blink-settings=imagesEnabled=false")
         if sys.platform.startswith("linux"):
             # Chrome refuses to start as root inside Docker without these.
             args += ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -439,17 +444,32 @@ class BrowserSession:
         self._crashed = False
 
     async def _html_when_ready(self):
-        """Return as soon as the product data is in the page. Don't sit out a fixed extra wait."""
-        deadline = time.monotonic() + PAGE_WAIT_SECONDS
+        """Return as soon as the product data is in the page. If a visible window is asking
+        for a check, wait and let the person finish it. The script does not complete that page."""
+        short = time.monotonic() + PAGE_WAIT_SECONDS
+        long = time.monotonic() + (CHALLENGE_WAIT_SECONDS if not HEADLESS else PAGE_WAIT_SECONDS)
+        deadline = short
+        told = False
         while True:
             try:
                 if await self._page.locator("#__NEXT_DATA__").count():
                     break
+                title = (await self._page.title() or "").lower()
             except Exception:
                 break
+            if (not HEADLESS) and ("verify your ide" in title or "robot or human" in title):
+                deadline = long
+                if not told:
+                    told = True
+                    print("[browser] Walmart is asking for a check in the Chrome window. Finish it there.")
+                    if self.on_challenge is not None:
+                        try:
+                            await self.on_challenge()
+                        except Exception as e:
+                            print(f"[browser] couldn't report the check: {e}")
             if time.monotonic() >= deadline:
                 break
-            await self._page.wait_for_timeout(200)
+            await self._page.wait_for_timeout(500)
         return await self._page.content()
 
     async def get(self, url, headers=None, timeout=20, proxies=None):
@@ -582,6 +602,12 @@ class Monitor:
         self.clock = clock
         self.sleep = sleep
         self.rand = rand
+        if hasattr(self.session, "on_challenge"):
+            self.session.on_challenge = self._challenge_notice
+
+    async def _challenge_notice(self):
+        await self._say("Walmart opened a check in the Chrome window. Finish it in that window. "
+                        "I'll wait up to 3 minutes and keep this same window.")
 
         st = load_json(STATE_FILE)
         self.first_run = st is None
@@ -806,6 +832,8 @@ class Monitor:
             except Exception:
                 pass
             self.session = self.session_factory()
+            if hasattr(self.session, "on_challenge"):
+                self.session.on_challenge = self._challenge_notice
         if not any(j[0] == "home" for j in self.priority):
             self.priority.appendleft(("home",))
 
