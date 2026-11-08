@@ -1,8 +1,8 @@
 """
 Walmart CA monitor for Discord.
 
-- Requests to Walmart are spaced a few seconds apart (see GAP_MIN / GAP_MAX).
-- Checks use curl with a Chrome TLS fingerprint. No browser.
+- Requests are a few seconds apart (see GAP_MIN / GAP_MAX).
+- Checks use a real Chrome window. It moves on as soon as the product data is in the page.
 - Alerts only post when the PRODUCT PAGE confirms: Walmart is the seller + in stock + real price.
 - It always tells you WHY (in alerts, status messages, and with !why).
 - You control it from Discord with commands (type !help in your alerts channel).
@@ -28,7 +28,7 @@ import unicodedata
 from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, unquote
 
 from curl_cffi.requests import AsyncSession
 
@@ -89,8 +89,15 @@ STATE_FILE = os.path.join(DATA_DIR, "walmart_state.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "walmart_config.json")
 BASE = "https://www.walmart.ca"
 
-# curl_cffi impersonates a real Chrome TLS/HTTP2 fingerprint. Override with IMPERSONATE if needed.
+# curl_cffi impersonates a real Chrome TLS/HTTP2 fingerprint. The product page still requires a real
+# browser, so Chrome is the default. Set FETCHER=curl only to compare.
 IMPERSONATE = os.environ.get("IMPERSONATE", "chrome").strip() or "chrome"
+FETCHER = os.environ.get("FETCHER", "browser").strip().lower()
+# A normal window completes Walmart's page check. HEADLESS=1 hides it, which is faster to paint but
+# more likely to sit on "Verify Your Identity".
+HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+# How long to keep looking for the product data after the page starts loading. Returns sooner if it's there.
+PAGE_WAIT_SECONDS = float(os.environ.get("PAGE_WAIT_SECONDS", "8"))
 # With the dashboard connected, status messages ("Now watching", blocks, Online) go only to the dashboard and
 # Discord gets only Restock / New Item alerts. Set STATUS_IN_DISCORD=1 to also post them in Discord.
 STATUS_IN_DISCORD = os.environ.get("STATUS_IN_DISCORD", "0") == "1"
@@ -341,12 +348,142 @@ def save_json(path, obj):
 
 
 # ------------------------------------------------------------ http session
+class PageResult:
+    def __init__(self, text, status_code):
+        self.text = text
+        self.status_code = status_code
+
+
+def browser_proxy(proxy):
+    if not proxy:
+        return None
+    u = urlsplit(proxy)
+    out = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        out["username"] = unquote(u.username)
+        out["password"] = unquote(u.password or "")
+    return out
+
+
+class BrowserSession:
+    """One real Chrome tab, reused. No fixed extra wait and no trip to a blank page between checks."""
+
+    def __init__(self, proxy=None):
+        self.proxy = proxy
+        self._pw = self._browser = self._ctx = self._page = None
+        self._crashed = False
+        self._closing = False
+        self._lock = asyncio.Lock()
+
+    def _alive(self):
+        return (self._page is not None and not self._crashed and not self._page.is_closed()
+                and self._browser.is_connected())
+
+    def _on_crash(self, _page):
+        self._crashed = True
+        print("[browser] the Walmart tab crashed")
+
+    async def _start(self):
+        from playwright.async_api import async_playwright
+        self._pw = await async_playwright().start()
+        args = ["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage",
+                "--disable-extensions", "--blink-settings=imagesEnabled=false", "--no-first-run"]
+        if self.proxy:
+            args += ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                     "--webrtc-ip-handling-policy=disable_non_proxied_udp"]
+        prefer = os.environ.get("CHROME_CHANNEL", "chrome").strip() or "chrome"
+        channels = []
+        for name in (prefer, "chrome", "msedge", "chromium"):
+            if name not in channels:
+                channels.append(name)
+        last = None
+        for channel in channels:
+            try:
+                self._browser = await self._pw.chromium.launch(
+                    channel=channel, headless=HEADLESS, proxy=browser_proxy(self.proxy), args=args)
+                print(f"[browser] using {channel} {self._browser.version}")
+                last = None
+                break
+            except Exception as e:
+                last = e
+                print(f"[browser] couldn't start {channel}: {type(e).__name__}: {str(e).splitlines()[0][:160]}")
+        if last is not None or self._browser is None:
+            raise last or RuntimeError("couldn't start Chrome")
+        self._closing = False
+        self._browser.on("disconnected", lambda _b: None if self._closing else
+                         print("[browser] Chrome closed unexpectedly"))
+        major = self._browser.version.split(".")[0]
+        ua = (f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+        self._ctx = await self._browser.new_context(
+            user_agent=ua, locale="en-CA", timezone_id="America/Toronto",
+            viewport={"width": 1366, "height": 768})
+        self._page = await self._ctx.new_page()
+        self._page.on("crash", self._on_crash)
+        self._crashed = False
+
+    async def _html_when_ready(self):
+        """Return as soon as the product data is in the page. Don't sit out a fixed extra wait."""
+        deadline = time.monotonic() + PAGE_WAIT_SECONDS
+        while True:
+            try:
+                if await self._page.locator("#__NEXT_DATA__").count():
+                    break
+            except Exception:
+                break
+            if time.monotonic() >= deadline:
+                break
+            await self._page.wait_for_timeout(200)
+        return await self._page.content()
+
+    async def get(self, url, headers=None, timeout=20, proxies=None):
+        async with self._lock:
+            if self._page is None:
+                await self._start()
+            elif not self._alive():
+                print("[browser] restarting Chrome")
+                await self.close()
+                await self._start()
+            referer = (headers or {}).get("Referer")
+            try:
+                resp = await self._page.goto(url, referer=referer, wait_until="domcontentloaded",
+                                             timeout=(timeout + 10) * 1000)
+                html = await self._html_when_ready()
+            except Exception as e:
+                print(f"[browser] loading {url} failed: {type(e).__name__}: {str(e)[:300]}")
+                raise
+            return PageResult(html, resp.status if resp else 0)
+
+    async def close(self):
+        self._closing = True
+        for obj in (self._ctx, self._browser):
+            if obj is not None:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+        if self._pw is not None:
+            try:
+                await self._pw.stop()
+            except Exception:
+                pass
+        self._pw = self._browser = self._ctx = self._page = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.close()
+
+
 def make_session(proxy=None):
-    """One curl session per connection. Cookies stick around between pages, same as a browser tab."""
-    kwargs = {"impersonate": IMPERSONATE}
-    if proxy:
-        kwargs["proxy"] = proxy
-    return AsyncSession(**kwargs)
+    """Chrome by default. FETCHER=curl keeps the old request path."""
+    if FETCHER == "curl":
+        kwargs = {"impersonate": IMPERSONATE}
+        if proxy:
+            kwargs["proxy"] = proxy
+        return AsyncSession(**kwargs)
+    return BrowserSession(proxy)
 
 
 # ------------------------------------------------------------ dashboard link
@@ -968,14 +1105,11 @@ async def test_mode():
 async def debug_sku(sku):
     proxy = get_proxy()
     async with make_session(proxy) as s:
-        print(f"Using curl with Chrome impersonation ({IMPERSONATE}).")
-        print("Opening the homepage, then a search page, like the bot does...")
+        print(f"Using Chrome. Homepage, then the product page.")
         await fetch_home(s, proxy)
         await asyncio.sleep(random.uniform(GAP_MIN, GAP_MAX))
-        await fetch_items(s, SEARCH_TERMS[0], proxy, referer=f"{BASE}/en")
-        await asyncio.sleep(random.uniform(GAP_MIN, GAP_MAX))
         print("--- PRODUCT PAGE (what the bot will alert with) ---")
-        v, status, data = await get_verified(s, sku, proxy, referer=search_url(SEARCH_TERMS[0]))
+        v, status, data = await get_verified(s, sku, proxy, referer=f"{BASE}/en")
         print(f"  page status: {status}")
         if v is None:
             print("  COULD NOT READ A PRICE from the product page. The bot will NOT alert on this item.")
@@ -1062,7 +1196,11 @@ def run_bot():
                     except Exception as e:
                         proxy_line += f"\nOutbound IP check failed: `{type(e).__name__}: {e}`"
 
-                method = f"curl, Chrome fingerprint ({IMPERSONATE}). No browser."
+                if FETCHER == "curl":
+                    method = f"curl, Chrome fingerprint ({IMPERSONATE}). No browser."
+                else:
+                    mode = "hidden Chrome" if HEADLESS else "a normal Chrome window (leave it open)"
+                    method = f"Chrome, {mode}. No extra wait after the product data loads."
                 await self.mon._say(
                     f"Online ({where}).\n{proxy_line}\n"
                     f"Method: {method}\n"
