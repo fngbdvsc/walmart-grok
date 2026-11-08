@@ -1,7 +1,8 @@
 """
 Walmart CA monitor for Discord.
 
-- Every request to Walmart is spaced 8-15 seconds apart (random).
+- Requests to Walmart are spaced a few seconds apart (see GAP_MIN / GAP_MAX).
+- Checks use curl with a Chrome TLS fingerprint. No browser.
 - Alerts only post when the PRODUCT PAGE confirms: Walmart is the seller + in stock + real price.
 - It always tells you WHY (in alerts, status messages, and with !why).
 - You control it from Discord with commands (type !help in your alerts channel).
@@ -27,7 +28,7 @@ import unicodedata
 from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote
 
 from curl_cffi.requests import AsyncSession
 
@@ -39,13 +40,12 @@ PROXY = ""             # optional: http://user:pass@host:port (leave "" for none
 ALLOWED_USER_IDS = []  # optional: [123456789012345678]. Empty = anyone with "Manage Server" can use commands
 # =======================================================
 
-GAP_MIN = 8                    # seconds between ANY two requests to Walmart...
-GAP_MAX = 15                   # ...random between these two numbers
+GAP_MIN = 2                    # seconds between ANY two requests to Walmart...
+GAP_MAX = 4                    # ...random between these two numbers
 
-# Each SKU is checked at most once per this many seconds. With a short list the bot IDLES between rounds
-# instead of re-loading the same few product pages every 10-20 seconds (that pattern gets you blocked).
-# Raise it if Walmart still blocks you (e.g. 90), lower it for faster drops (e.g. 30). Can be set in Railway Variables.
-MIN_SECONDS_PER_ROUND = int(os.environ.get("MIN_SECONDS_PER_ROUND", "45"))
+# Each SKU is checked at most once per this many seconds. Curl is fast, so the floor is what
+# actually sets the pace. Raise it in Railway (MIN_SECONDS_PER_ROUND) if Walmart starts blocking.
+MIN_SECONDS_PER_ROUND = int(os.environ.get("MIN_SECONDS_PER_ROUND", "15"))
 
 ONLY_WALMART_SOLD = True       # alert only when the product page shows Walmart as the seller
 PING_ON_NEW_ITEM = True        # ping the role for New Item alerts too, not just restocks
@@ -63,7 +63,7 @@ SEARCH_TERMS = ["pokemon", "pokemon tcg"]
 # and over with no cookies or referrer is what got the bot blocked once search scan was turned off.
 BROWSE_FIRST = os.environ.get("BROWSE_FIRST", "1") != "0"
 
-# After a block: start a brand-new browser (1, default) or keep the same one and its cookies (0).
+# After a block: throw away the session and its cookies (1, default) or keep them (0).
 # Keeping the flagged cookies left the bot blocked hundreds of times in a row.
 FRESH_BROWSER_ON_BLOCK = os.environ.get("FRESH_BROWSER_ON_BLOCK", "1") != "0"
 SEARCH_PAGES = 1
@@ -90,12 +90,8 @@ STATE_FILE = os.path.join(DATA_DIR, "walmart_state.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "walmart_config.json")
 BASE = "https://www.walmart.ca"
 
-# "browser" = load Walmart pages in a real headless Chrome (runs Walmart's JavaScript security check).
-# "curl" = the old lightweight method. Set FETCHER in Railway Variables to switch.
-FETCHER = os.environ.get("FETCHER", "browser").strip().lower()
-# On Railway the Dockerfile runs Chrome on a virtual screen (HEADLESS=0); hidden Chrome on a Linux server
-# has tells that a normal window doesn't. Without a screen (e.g. on a Mac test), it falls back to hidden.
-HEADLESS = os.environ.get("HEADLESS", "1") != "0" or not os.environ.get("DISPLAY")
+# curl_cffi impersonates a real Chrome TLS/HTTP2 fingerprint. Override with IMPERSONATE if needed.
+IMPERSONATE = os.environ.get("IMPERSONATE", "chrome").strip() or "chrome"
 # With the dashboard connected, status messages ("Now watching", blocks, Online) go only to the dashboard and
 # Discord gets only Restock / New Item alerts. Set STATUS_IN_DISCORD=1 to also post them in Discord.
 STATUS_IN_DISCORD = os.environ.get("STATUS_IN_DISCORD", "0") == "1"
@@ -345,165 +341,13 @@ def save_json(path, obj):
         print(f"[warning] couldn't save {path}: {e}")
 
 
-# ------------------------------------------------------------ real browser
-class PageResult:
-    def __init__(self, text, status_code):
-        self.text = text
-        self.status_code = status_code
-
-
-def browser_proxy(proxy):
-    if not proxy:
-        return None
-    u = urlsplit(proxy)
-    out = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
-    if u.username:
-        out["username"] = unquote(u.username)
-        out["password"] = unquote(u.password or "")
-    return out
-
-
-class BrowserSession:
-    """Headless Chrome with the same get() shape as the curl session. One tab, reused, so cookies and
-    Walmart's security-check state carry over between pages like in a normal browser."""
-
-    RECYCLE_PAGES = 30     # restart Chrome (keeping cookies) this often so its memory doesn't keep growing
-
-    def __init__(self, proxy=None):
-        self.proxy = proxy
-        self._pw = self._browser = self._ctx = self._page = None
-        self._crashed = False
-        self._pages = 0
-        self._lock = asyncio.Lock()
-
-    async def _cookies(self):
-        try:
-            if self._ctx is not None and self._browser.is_connected():
-                return await self._ctx.storage_state()
-        except Exception:
-            pass
-        return None
-
-    async def _restart(self, why):
-        """Fresh Chrome process, same cookies, so to Walmart it's still the same browser."""
-        state = await self._cookies()
-        print(f"[browser] restarting Chrome ({why}){', keeping cookies' if state else ''}")
-        await self.close()
-        await self._start(state)
-
-    def _alive(self):
-        return (self._page is not None and not self._crashed and not self._page.is_closed()
-                and self._browser.is_connected())
-
-    def _on_crash(self, _page):
-        self._crashed = True
-        print("[browser] the Walmart tab crashed (usually means Chrome ran out of memory)")
-
-    async def _start(self, storage_state=None):
-        from playwright.async_api import async_playwright
-        self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            channel="chromium", headless=HEADLESS, proxy=browser_proxy(self.proxy),
-            # Images are switched off with a flag, not request blocking: blocking requests in Playwright
-            # turns off the browser cache, so Walmart's scripts would be re-downloaded on every page.
-            args=["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage",
-                  "--disable-extensions", "--blink-settings=imagesEnabled=false",
-                  # WebRTC would otherwise reveal Railway's real address next to the proxy's address.
-                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-                  "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-                  # Memory savers for Railway's 1 GB Trial limit: one page process instead of one per
-                  # embedded frame, and no background features.
-                  "--renderer-process-limit=1", "--disable-site-isolation-trials",
-                  "--disable-features=site-per-process,IsolateOrigins,Translate,BackForwardCache,"
-                  "MediaRouter,OptimizationHints",
-                  "--disable-background-networking", "--disable-component-update", "--no-first-run"])
-        self._closing = False
-        self._browser.on("disconnected", lambda _b: None if self._closing else
-                         print("[browser] Chrome closed unexpectedly (often: Railway ran out of memory)"))
-        major = self._browser.version.split(".")[0]
-        # Headless Chrome announces itself as "HeadlessChrome" unless told otherwise.
-        ua = (f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-              f"Chrome/{major}.0.0.0 Safari/537.36")
-        self._ctx = await self._browser.new_context(
-            user_agent=ua, locale="en-CA", timezone_id="America/Toronto",
-            viewport={"width": 1366, "height": 768}, storage_state=storage_state)
-        self._page = await self._ctx.new_page()
-        self._page.on("crash", self._on_crash)
-        self._crashed = False
-        self._pages = 0
-
-    async def get(self, url, headers=None, timeout=20, proxies=None):
-        async with self._lock:
-            if self._page is None:
-                await self._start()
-            elif not self._alive():
-                await self._restart("it crashed or closed")
-            elif self._pages >= self.RECYCLE_PAGES:
-                await self._restart("routine memory cleanup")
-            referer = (headers or {}).get("Referer")
-            try:
-                resp = await self._page.goto(url, referer=referer, wait_until="domcontentloaded",
-                                             timeout=(timeout + 10) * 1000)
-                await self._page.wait_for_timeout(random.uniform(1500, 3500))   # let the security check run
-                html = await self._page.content()
-            except Exception as e:
-                print(f"[browser] loading {url} failed: {type(e).__name__}: {str(e)[:300]}")
-                raise                      # a dead Chrome is restarted on the next request
-            finally:
-                self._pages += 1
-            try:
-                await self._page.goto("about:blank")   # free the heavy Walmart page while we wait
-            except Exception:
-                pass
-            return PageResult(html, resp.status if resp else 0)
-
-    async def describe(self):
-        """Startup check through Chrome itself (not curl): version, window mode, and the IP Walmart will see."""
-        async with self._lock:
-            if not self._alive():
-                await self.close()
-                await self._start()
-            try:
-                await self._page.goto("https://api.ipify.org", timeout=20000)
-                ip = (await self._page.inner_text("body")).strip()[:60]
-            except Exception as e:
-                ip = f"check failed ({type(e).__name__}: {str(e).splitlines()[0][:120]})"
-            try:
-                await self._page.wait_for_timeout(500)      # let a failed load finish showing its error page
-                await self._page.goto("about:blank")
-            except Exception:
-                pass
-            mode = "hidden (headless)" if HEADLESS else "normal window on a virtual screen"
-            line = f"Chrome {self._browser.version}, {mode}. Chrome's own outbound IP: `{ip}`"
-            print(f"[browser] {line}")
-            return line
-
-    async def close(self):
-        self._closing = True
-        for obj in (self._ctx, self._browser):
-            if obj is not None:
-                try:
-                    await obj.close()
-                except Exception:
-                    pass
-        if self._pw is not None:
-            try:
-                await self._pw.stop()
-            except Exception:
-                pass
-        self._pw = self._browser = self._ctx = self._page = None
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        await self.close()
-
-
+# ------------------------------------------------------------ http session
 def make_session(proxy=None):
-    if FETCHER == "curl":
-        return AsyncSession(impersonate="chrome")
-    return BrowserSession(proxy)
+    """One curl session per connection. Cookies stick around between pages, same as a browser tab."""
+    kwargs = {"impersonate": IMPERSONATE}
+    if proxy:
+        kwargs["proxy"] = proxy
+    return AsyncSession(**kwargs)
 
 
 # ------------------------------------------------------------ dashboard link
@@ -622,7 +466,7 @@ class Monitor:
     # ---- small helpers
     def dash_log(self, kind, content, sku=None):
         if self.shipper:
-            self.shipper.push(kind, re.sub(r"[*`]", "", content), sku)
+            self.shipper.push(kind, re.sub(r"[`*]", "", content), sku)
 
     def dash_error(self, key, content, sku=None):
         """Every error goes to the Discord error channel; the dashboard gets the same one at most every ERROR_REPEAT_SECONDS."""
@@ -744,7 +588,7 @@ class Monitor:
                     continue
                 job = self.next_job()
                 if job is None:
-                    await self.sleep(5)
+                    await self.sleep(1)
                     continue
                 await self.wait_turn()
                 if self.paused:                      # paused while we were waiting
@@ -801,7 +645,7 @@ class Monitor:
                 await self.sleep(5)
 
     async def reset_session(self):
-        """After a block, go back through the homepage; only throw away the browser if FRESH_BROWSER_ON_BLOCK."""
+        """After a block, go back through the homepage and drop the flagged cookies."""
         self.referer = None
         if FRESH_BROWSER_ON_BLOCK and self.session_factory is not None:
             try:
@@ -1059,7 +903,7 @@ class Monitor:
 
         if cmd == "resume":
             self.paused = False
-            return "Resumed. Checks continue (each request 8-15 seconds apart)."
+            return f"Resumed. Checks continue (each request {GAP_MIN:g}-{GAP_MAX:g} seconds apart)."
 
         if cmd == "refresh":
             self.refresh = True
@@ -1124,7 +968,7 @@ async def test_mode():
 async def debug_sku(sku):
     proxy = get_proxy()
     async with make_session(proxy) as s:
-        print(f"Using the {'real browser' if FETCHER != 'curl' else 'curl'} method.")
+        print(f"Using curl with Chrome impersonation ({IMPERSONATE}).")
         print("Opening the homepage, then a search page, like the bot does...")
         await fetch_home(s, proxy)
         await asyncio.sleep(random.uniform(GAP_MIN, GAP_MAX))
@@ -1218,17 +1062,12 @@ def run_bot():
                     except Exception as e:
                         proxy_line += f"\nOutbound IP check failed: `{type(e).__name__}: {e}`"
 
-                if isinstance(self.mon.session, BrowserSession):
-                    try:
-                        method = "real Chrome browser\n" + await self.mon.session.describe()
-                    except Exception as e:
-                        method = f"real Chrome browser\nChrome failed to start: `{type(e).__name__}: {e}`"
-                else:
-                    method = "curl (no browser). Delete the FETCHER variable in Railway to use Chrome."
+                method = f"curl, Chrome fingerprint ({IMPERSONATE}). No browser."
                 await self.mon._say(
                     f"Online ({where}).\n{proxy_line}\n"
                     f"Method: {method}\n"
-                    f"Every request to Walmart is 8-15s apart. Type `!help` for commands."
+                    f"Requests are {GAP_MIN:g}-{GAP_MAX:g}s apart, and each SKU is checked about every "
+                    f"{self.mon.round_estimate()}s. Type `!help` for commands."
                 )
                 jobs = [self.mon.run(), self.mon.run_sync()]
                 if self.shipper:

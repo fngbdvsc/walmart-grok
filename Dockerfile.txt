@@ -1,12 +1,9 @@
-FROM mcr.microsoft.com/playwright/python:v1.63.0-noble
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-# Run Chrome as a normal window on a virtual screen instead of hidden mode.
-ENV HEADLESS=0
-# Show the bot's print() lines in Railway's logs right away instead of holding them in a buffer.
 ENV PYTHONUNBUFFERED=1
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1366x768x24", "python", "walmart_monitor.py"]
+CMD ["python", "walmart_monitor.py"]
