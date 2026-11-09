@@ -29,7 +29,7 @@ import unicodedata
 from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import quote, urlsplit, unquote
+from urllib.parse import quote, urlsplit, unquote, parse_qs
 
 from curl_cffi.requests import AsyncSession
 
@@ -114,6 +114,39 @@ ERROR_REPEAT_SECONDS = 600        # don't send the same error to the dashboard m
 
 LOCAL_TZ = ZoneInfo(os.environ.get("TIMEZONE", "America/Toronto"))   # Quebec time; Railway's clock is UTC
 BLOCK_REASON = "Walmart's bot-check page appeared, so this check was paused."
+
+
+def decode_queue(link):
+    """Read the ticket already stored in a Walmart waiting-room link. Does not join or move a queue."""
+    raw = (link or "").strip().strip("<>")
+    blob = None
+    if "://" in raw or "qpdata=" in raw:
+        blob = (parse_qs(urlsplit(raw).query).get("qpdata") or [None])[0]
+    if not blob:
+        blob = raw
+    try:
+        data = json.loads(unquote(blob))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def format_queue(data):
+    meta = data.get("customMetadata") if isinstance(data.get("customMetadata"), dict) else {}
+    item = meta.get("item") if isinstance(meta.get("item"), dict) else {}
+    ticket = data.get("ticket") or "not assigned yet"
+    likelihood = meta.get("admissionLikelihood") or "unknown"
+    name = item.get("name")
+    ts = data.get("expectedTurnTimeUnixTimestamp")
+    if isinstance(ts, (int, float)) and ts > 0:
+        seconds = ts / 1000 if ts > 10_000_000_000 else ts
+        turn = datetime.fromtimestamp(seconds, LOCAL_TZ).strftime("%I:%M:%S %p")
+    else:
+        turn = "not set"
+    lines = [f"Ticket: `{ticket}`", f"Expected turn: {turn}", f"Likelihood: {likelihood}"]
+    if name:
+        lines.append(f"Item: {name}")
+    return "\n".join(lines)
 
 
 def local_now():
@@ -1016,6 +1049,14 @@ class Monitor:
             return None
         cmd, args = parts[0][1:].lower(), parts[1:]
 
+        if cmd in ("queue", "q"):
+            if not args:
+                return "Paste your waiting-room link: `!queue <link>`"
+            data = decode_queue(" ".join(args))
+            if not data:
+                return "No ticket in that link. Paste the full Walmart waiting-room link."
+            return format_queue(data)
+
         if self.dashboard and cmd in ("watch", "add", "remove", "unwatch", "delete", "pause", "resume"):
             return "The dashboard controls the SKU list and pause/resume now. Make that change there."
 
@@ -1128,7 +1169,8 @@ class Monitor:
                     "`!why SKU` - the reason for my latest decision on one product\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
                     "`!refresh` - start a fresh check round right now\n"
-                    "`!status` - am I running, blocked or paused")
+                    "`!status` - am I running, blocked or paused\n"
+                    "`!queue <link>` - read the ticket number in a Walmart waiting-room link")
         return None
 
 
